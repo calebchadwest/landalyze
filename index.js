@@ -1,6 +1,6 @@
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import Database from 'better-sqlite3';
+import pg from 'pg';
 import { Resend } from 'resend';
 import cron from 'node-cron';
 
@@ -14,26 +14,22 @@ const FROM_EMAIL = process.env.RESEND_FROM || 'digest@landalyze.com';
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
-const db = new Database(process.env.DB_PATH || 'landalyze.db');
-db.exec(`
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+await pool.query(`
   CREATE TABLE IF NOT EXISTS subscriptions (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    email     TEXT    NOT NULL,
-    city      TEXT    NOT NULL,
-    frequency TEXT    NOT NULL CHECK(frequency IN ('daily', 'weekly', 'monthly')),
-    created_at TEXT   NOT NULL DEFAULT (datetime('now')),
-    last_sent_at TEXT,
-    active    INTEGER NOT NULL DEFAULT 1
+    id           SERIAL PRIMARY KEY,
+    email        TEXT    NOT NULL,
+    city         TEXT    NOT NULL,
+    frequency    TEXT    NOT NULL CHECK(frequency IN ('daily', 'weekly', 'monthly')),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_sent_at TIMESTAMPTZ,
+    active       BOOLEAN NOT NULL DEFAULT TRUE
   );
-  CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON subscriptions(email);
+  CREATE INDEX IF NOT EXISTS idx_subscriptions_email     ON subscriptions(email);
   CREATE INDEX IF NOT EXISTS idx_subscriptions_frequency ON subscriptions(frequency, active);
 `);
-
-const insertSub   = db.prepare('INSERT INTO subscriptions (email, city, frequency) VALUES (?, ?, ?)');
-const activeSubs  = db.prepare('SELECT * FROM subscriptions WHERE active = 1 AND frequency = ?');
-const subsByEmail = db.prepare('SELECT * FROM subscriptions WHERE email = ? AND active = 1');
-const deactivate  = db.prepare('UPDATE subscriptions SET active = 0 WHERE id = ?');
-const touchSent   = db.prepare("UPDATE subscriptions SET last_sent_at = datetime('now') WHERE id = ?");
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -85,15 +81,18 @@ async function sendCityIntel(sub) {
     html: formatIntelEmail(sub.city, intel),
   });
 
-  touchSent.run(sub.id);
+  await pool.query('UPDATE subscriptions SET last_sent_at = NOW() WHERE id = $1', [sub.id]);
 }
 
 // ─── Scheduled jobs ───────────────────────────────────────────────────────────
 
 async function runDigestForFrequency(frequency) {
-  const subs = activeSubs.all(frequency);
-  console.log(`[cron] ${frequency}: sending intel for ${subs.length} subscription(s)`);
-  for (const sub of subs) {
+  const { rows } = await pool.query(
+    'SELECT * FROM subscriptions WHERE active = TRUE AND frequency = $1',
+    [frequency]
+  );
+  console.log(`[cron] ${frequency}: sending intel for ${rows.length} subscription(s)`);
+  for (const sub of rows) {
     await sendCityIntel(sub).catch(err =>
       console.error(`[cron] failed for sub ${sub.id} (${sub.email}/${sub.city}):`, err.message)
     );
@@ -127,8 +126,11 @@ app.post('/subscribe', async (req, res) => {
 
   const created = [];
   for (const city of cities) {
-    const info = insertSub.run(email, city.trim(), frequency);
-    created.push({ id: info.lastInsertRowid, email, city: city.trim(), frequency });
+    const { rows } = await pool.query(
+      'INSERT INTO subscriptions (email, city, frequency) VALUES ($1, $2, $3) RETURNING *',
+      [email, city.trim(), frequency]
+    );
+    created.push(rows[0]);
   }
 
   res.json({ subscriptions: created });
@@ -142,18 +144,25 @@ app.post('/subscribe', async (req, res) => {
 });
 
 // GET /subscriptions?email=...
-app.get('/subscriptions', (req, res) => {
+app.get('/subscriptions', async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'email query param required' });
-  res.json({ subscriptions: subsByEmail.all(email) });
+  const { rows } = await pool.query(
+    'SELECT * FROM subscriptions WHERE email = $1 AND active = TRUE',
+    [email]
+  );
+  res.json({ subscriptions: rows });
 });
 
 // DELETE /subscriptions/:id
-app.delete('/subscriptions/:id', (req, res) => {
+app.delete('/subscriptions/:id', async (req, res) => {
   const { id } = req.params;
-  const info = deactivate.run(Number(id));
-  if (info.changes === 0) return res.status(404).json({ error: 'subscription not found' });
-  res.json({ cancelled: Number(id) });
+  const { rows } = await pool.query(
+    'UPDATE subscriptions SET active = FALSE WHERE id = $1 RETURNING id',
+    [Number(id)]
+  );
+  if (rows.length === 0) return res.status(404).json({ error: 'subscription not found' });
+  res.json({ cancelled: rows[0].id });
 });
 
 // POST /city-intel
