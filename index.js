@@ -15,21 +15,34 @@ const FROM_EMAIL = process.env.RESEND_FROM || 'digest@landalyze.com';
 // ─── Database ────────────────────────────────────────────────────────────────
 
 const { Pool } = pg;
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+let pool = null;
 
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS subscriptions (
-    id           SERIAL PRIMARY KEY,
-    email        TEXT    NOT NULL,
-    city         TEXT    NOT NULL,
-    frequency    TEXT    NOT NULL CHECK(frequency IN ('daily', 'weekly', 'monthly')),
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_sent_at TIMESTAMPTZ,
-    active       BOOLEAN NOT NULL DEFAULT TRUE
-  );
-  CREATE INDEX IF NOT EXISTS idx_subscriptions_email     ON subscriptions(email);
-  CREATE INDEX IF NOT EXISTS idx_subscriptions_frequency ON subscriptions(frequency, active);
-`);
+async function initDb() {
+  if (!process.env.DATABASE_URL) {
+    console.log('[db] DATABASE_URL not set — subscriptions disabled');
+    return;
+  }
+  try {
+    const candidate = new Pool({ connectionString: process.env.DATABASE_URL });
+    await candidate.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id           SERIAL PRIMARY KEY,
+        email        TEXT    NOT NULL,
+        city         TEXT    NOT NULL,
+        frequency    TEXT    NOT NULL CHECK(frequency IN ('daily', 'weekly', 'monthly')),
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_sent_at TIMESTAMPTZ,
+        active       BOOLEAN NOT NULL DEFAULT TRUE
+      );
+      CREATE INDEX IF NOT EXISTS idx_subscriptions_email     ON subscriptions(email);
+      CREATE INDEX IF NOT EXISTS idx_subscriptions_frequency ON subscriptions(frequency, active);
+    `);
+    pool = candidate;
+    console.log('[db] PostgreSQL connected');
+  } catch (err) {
+    console.error('[db] PostgreSQL unavailable — subscriptions disabled:', err.message);
+  }
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -81,12 +94,15 @@ async function sendCityIntel(sub) {
     html: formatIntelEmail(sub.city, intel),
   });
 
-  await pool.query('UPDATE subscriptions SET last_sent_at = NOW() WHERE id = $1', [sub.id]);
+  if (pool) {
+    await pool.query('UPDATE subscriptions SET last_sent_at = NOW() WHERE id = $1', [sub.id]);
+  }
 }
 
 // ─── Scheduled jobs ───────────────────────────────────────────────────────────
 
 async function runDigestForFrequency(frequency) {
+  if (!pool) return;
   const { rows } = await pool.query(
     'SELECT * FROM subscriptions WHERE active = TRUE AND frequency = $1',
     [frequency]
@@ -112,6 +128,8 @@ app.get('/health', (req, res) => {
 // POST /subscribe
 // Body: { email, cities: string[], frequency: 'daily'|'weekly'|'monthly' }
 app.post('/subscribe', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'subscriptions unavailable — database not connected' });
+
   const { email, cities, frequency } = req.body;
 
   if (!email || !cities || !frequency) {
@@ -145,6 +163,7 @@ app.post('/subscribe', async (req, res) => {
 
 // GET /subscriptions?email=...
 app.get('/subscriptions', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'subscriptions unavailable — database not connected' });
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'email query param required' });
   const { rows } = await pool.query(
@@ -156,6 +175,7 @@ app.get('/subscriptions', async (req, res) => {
 
 // DELETE /subscriptions/:id
 app.delete('/subscriptions/:id', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'subscriptions unavailable — database not connected' });
   const { id } = req.params;
   const { rows } = await pool.query(
     'UPDATE subscriptions SET active = FALSE WHERE id = $1 RETURNING id',
@@ -354,4 +374,5 @@ Return this exact JSON structure:
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
+await initDb();
 app.listen(PORT, () => console.log(`Landalyze backend running on port ${PORT}`));
