@@ -1,15 +1,228 @@
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
+import Database from 'better-sqlite3';
+import { Resend } from 'resend';
+import cron from 'node-cron';
 
 const app = express();
 app.use(express.json());
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const resend = new Resend(process.env.RESEND_API_KEY);
+const CITY_INTEL_URL = process.env.CITY_INTEL_URL || 'https://landalyze-production.up.railway.app/city-intel';
+const FROM_EMAIL = process.env.RESEND_FROM || 'digest@landalyze.com';
+
+// ─── Database ────────────────────────────────────────────────────────────────
+
+const db = new Database(process.env.DB_PATH || 'landalyze.db');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS subscriptions (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    email     TEXT    NOT NULL,
+    city      TEXT    NOT NULL,
+    frequency TEXT    NOT NULL CHECK(frequency IN ('daily', 'weekly', 'monthly')),
+    created_at TEXT   NOT NULL DEFAULT (datetime('now')),
+    last_sent_at TEXT,
+    active    INTEGER NOT NULL DEFAULT 1
+  );
+  CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON subscriptions(email);
+  CREATE INDEX IF NOT EXISTS idx_subscriptions_frequency ON subscriptions(frequency, active);
+`);
+
+const insertSub   = db.prepare('INSERT INTO subscriptions (email, city, frequency) VALUES (?, ?, ?)');
+const activeSubs  = db.prepare('SELECT * FROM subscriptions WHERE active = 1 AND frequency = ?');
+const subsByEmail = db.prepare('SELECT * FROM subscriptions WHERE email = ? AND active = 1');
+const deactivate  = db.prepare('UPDATE subscriptions SET active = 0 WHERE id = ?');
+const touchSent   = db.prepare("UPDATE subscriptions SET last_sent_at = datetime('now') WHERE id = ?");
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function formatIntelEmail(city, intel) {
+  const bullets = (intel.digest || [])
+    .map(b => `<li style="margin-bottom:8px">${b}</li>`)
+    .join('');
+  const sources = (intel.sources || [])
+    .map(s => `<li><a href="${s}" style="color:#4f46e5">${s}</a></li>`)
+    .join('');
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:sans-serif;max-width:640px;margin:0 auto;padding:24px;color:#111">
+  <div style="border-bottom:2px solid #4f46e5;padding-bottom:12px;margin-bottom:24px">
+    <h1 style="margin:0;font-size:22px">Landalyze City Intel</h1>
+    <p style="margin:4px 0 0;color:#6b7280;font-size:14px">${city} &mdash; ${new Date().toLocaleDateString('en-CA', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+  </div>
+  <h2 style="font-size:16px;color:#4f46e5;margin-bottom:12px">What's Happening</h2>
+  <ul style="padding-left:20px;line-height:1.6">${bullets}</ul>
+  ${sources ? `<h2 style="font-size:14px;color:#6b7280;margin-top:24px">Sources</h2><ul style="padding-left:20px;font-size:13px;color:#6b7280">${sources}</ul>` : ''}
+  <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb">
+  <p style="font-size:12px;color:#9ca3af;margin-top:12px">
+    You're receiving this because you subscribed to city intel for ${city}.
+    Reply to this email to unsubscribe.
+  </p>
+</body>
+</html>`;
+}
+
+async function sendCityIntel(sub) {
+  const response = await fetch(CITY_INTEL_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ city: sub.city }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`city-intel returned ${response.status}`);
+  }
+
+  const intel = await response.json();
+
+  await resend.emails.send({
+    from: FROM_EMAIL,
+    to: sub.email,
+    subject: `Landalyze City Intel: ${sub.city} — ${new Date().toLocaleDateString('en-CA')}`,
+    html: formatIntelEmail(sub.city, intel),
+  });
+
+  touchSent.run(sub.id);
+}
+
+// ─── Scheduled jobs ───────────────────────────────────────────────────────────
+
+async function runDigestForFrequency(frequency) {
+  const subs = activeSubs.all(frequency);
+  console.log(`[cron] ${frequency}: sending intel for ${subs.length} subscription(s)`);
+  for (const sub of subs) {
+    await sendCityIntel(sub).catch(err =>
+      console.error(`[cron] failed for sub ${sub.id} (${sub.email}/${sub.city}):`, err.message)
+    );
+  }
+}
+
+cron.schedule('0 9 * * *',   () => runDigestForFrequency('daily'));    // 9 AM daily
+cron.schedule('0 9 * * 1',   () => runDigestForFrequency('weekly'));   // 9 AM every Monday
+cron.schedule('0 9 1 * *',   () => runDigestForFrequency('monthly'));  // 9 AM first of month
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'landalyze-backend' });
 });
 
+// POST /subscribe
+// Body: { email, cities: string[], frequency: 'daily'|'weekly'|'monthly' }
+app.post('/subscribe', async (req, res) => {
+  const { email, cities, frequency } = req.body;
+
+  if (!email || !cities || !frequency) {
+    return res.status(400).json({ error: 'email, cities, and frequency are required' });
+  }
+  if (!Array.isArray(cities) || cities.length === 0) {
+    return res.status(400).json({ error: 'cities must be a non-empty array' });
+  }
+  if (!['daily', 'weekly', 'monthly'].includes(frequency)) {
+    return res.status(400).json({ error: 'frequency must be daily, weekly, or monthly' });
+  }
+
+  const created = [];
+  for (const city of cities) {
+    const info = insertSub.run(email, city.trim(), frequency);
+    created.push({ id: info.lastInsertRowid, email, city: city.trim(), frequency });
+  }
+
+  res.json({ subscriptions: created });
+
+  // Send initial intel for each city in the background
+  for (const sub of created) {
+    sendCityIntel(sub).catch(err =>
+      console.error(`[subscribe] initial send failed for ${sub.email}/${sub.city}:`, err.message)
+    );
+  }
+});
+
+// GET /subscriptions?email=...
+app.get('/subscriptions', (req, res) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'email query param required' });
+  res.json({ subscriptions: subsByEmail.all(email) });
+});
+
+// DELETE /subscriptions/:id
+app.delete('/subscriptions/:id', (req, res) => {
+  const { id } = req.params;
+  const info = deactivate.run(Number(id));
+  if (info.changes === 0) return res.status(404).json({ error: 'subscription not found' });
+  res.json({ cancelled: Number(id) });
+});
+
+// POST /city-intel
+// Body: { city }
+app.post('/city-intel', async (req, res) => {
+  try {
+    const { city } = req.body;
+    if (!city) return res.status(400).json({ error: 'city is required' });
+
+    const messages = [
+      {
+        role: 'user',
+        content: `You are a real estate intelligence analyst. Search for the latest news for ${city} across these 6 categories:
+
+1. Recent zoning bylaw changes or proposals
+2. City council decisions affecting land use or development
+3. Development permit approvals, denials, or notable applications
+4. CMHC updates or federal/provincial housing policy changes
+5. Financing rate changes or mortgage market news
+6. Community discussion (Reddit: r/canadahousing, r/PersonalFinanceCanada, local city subreddits)
+
+Return a JSON object only — no markdown, no explanation:
+{
+  "city": "${city}",
+  "digest": ["5 to 7 concise bullet points, each a single sentence with the key fact"],
+  "sources": ["url1", "url2", ...]
+}`
+      }
+    ];
+
+    let response = await client.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 8000,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages,
+    });
+
+    // Handle multi-turn web search
+    while (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      const toolResults = toolUseBlocks.map(tb => ({
+        type: 'tool_result',
+        tool_use_id: tb.id,
+        content: tb.type === 'tool_use' ? (tb.input?.query || '') : '',
+      }));
+
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({ role: 'user', content: toolResults });
+
+      response = await client.messages.create({
+        model: 'claude-opus-4-6',
+        max_tokens: 8000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages,
+      });
+    }
+
+    const text = response.content.find(b => b.type === 'text')?.text || '';
+    const match = text.match(/\{[\s\S]*\}/);
+    const intel = match ? JSON.parse(match[0]) : { city, digest: [], sources: [] };
+
+    res.json(intel);
+  } catch (err) {
+    console.error('/city-intel error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /analyze
 app.post('/analyze', async (req, res) => {
   try {
     const { property } = req.body;
@@ -115,4 +328,21 @@ Return this exact JSON structure:
     });
 
     const text = response.content
-      .filter(b => b.type === 'te
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return res.status(500).json({ error: 'No JSON in response' });
+
+    res.json(JSON.parse(match[0]));
+  } catch (err) {
+    console.error('/analyze error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Landalyze backend running on port ${PORT}`));
