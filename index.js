@@ -16,6 +16,13 @@ app.post('/analyze', async (req, res) => {
     const response = await client.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 2000,
-      messages: [{
-        role: 'user',
-        content: `You are a land development feasibility analyst. Analyze this property and return JSON only with keys: grade (A+ to F), zone_summary, as_of_right (max_units, max_height, fsr), rezoning_
+      messages: [{ role: 'user', content: 'Analyze this land deal and return JSON only. Keys: grade, zone_summary, as_of_right, rezoning_potential, red_flags, what_buyer_needs, disclaimer. Property: ' + JSON.stringify(property) }]
+    });
+    res.json({ result: response.content[0].text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Landalyze backend running on port ' + PORT));
